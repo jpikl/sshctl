@@ -1,0 +1,188 @@
+#!/usr/bin/env sh
+
+set -eu
+
+usage() {
+    echo "Control ssh-agent process and share it between multiple login sessions."
+    echo
+    echo "Usage: ${0##*/} <command>"
+    echo
+    echo "Commands:"
+    echo "  status   Print agent status"
+    echo "  start    Start agent if needed"
+    echo "  stop     Stop agent if needed"
+    echo "  restart  Restart agent"
+    echo "  help     Print this help"
+}
+
+main() {
+    case "${1-}" in
+    status) validate_env ;;
+    start | stop | restart) control_agent "$1" ;;
+    help | -h | --help) usage ;;
+    *)
+        log "invalid <command> argument, run '${0##*/} help' for usage"
+        exit 1
+        ;;
+    esac
+}
+
+# =============================================================================
+# Agent
+# =============================================================================
+
+control_agent() {
+    detect_paths
+
+    if [ -x "$(command -v flock)" ]; then
+        exec 3>"$LOCK_FILE"
+        flock 3
+    fi
+
+    if ! validate_env; then
+        load_env
+    fi
+
+    if [ "$1" = stop ] || [ "$1" = restart ] || ! is_env_valid; then
+        kill_agent
+
+        if [ "$1" = start ] || [ "$1" = restart ]; then
+            start_agent
+        fi
+    fi
+
+    if [ -x "$(command -v flock)" ]; then
+        flock -u 3
+    fi
+
+    if is_env_valid; then
+        export_env
+    else
+        unset_env
+    fi
+}
+
+start_agent() {
+    log "starting agent"
+    eval "$(ssh-agent)" >/dev/null
+
+    if validate_env; then
+        log "generating $ENV_FILE"
+        export_env >"$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+    fi
+}
+
+kill_agent() {
+    if [ -f "$ENV_FILE" ]; then
+        log "deleting $ENV_FILE"
+        rm "$ENV_FILE"
+    fi
+
+    if [ "$PID_STATE" = valid ]; then
+        log "killing agent pid $SSH_AGENT_PID"
+        kill "$SSH_AGENT_PID"
+        PID_STATE=invalid
+    fi
+
+    if [ "$SOCK_STATE" = valid ]; then
+        log "deleting auth socket $SSH_AUTH_SOCK"
+        rm -f "$SSH_AUTH_SOCK"
+        SOCK_STATE=invalid
+    fi
+}
+
+# =============================================================================
+# Environment
+# =============================================================================
+
+export_env() {
+    echo "export SSH_AGENT_PID=$SSH_AGENT_PID;"
+    echo "export SSH_AUTH_SOCK=$SSH_AUTH_SOCK;"
+}
+
+unset_env() {
+    echo "unset SSH_AGENT_PID;"
+    echo "unset SSH_AUTH_SOCK;"
+}
+
+load_env() {
+    if [ -f "$ENV_FILE" ]; then
+        log "loading $ENV_FILE"
+        # shellcheck disable=SC1090
+        . "$ENV_FILE" || true
+        validate_env || true
+    fi
+}
+
+validate_env() {
+    PID_STATE=$(validate_pid)
+    SOCK_STATE=$(validate_sock)
+    is_env_valid
+}
+
+is_env_valid() {
+    [ "$PID_STATE" = valid ] && [ "$SOCK_STATE" = valid ]
+}
+
+validate_pid() {
+    if [ "${SSH_AGENT_PID-}" ]; then
+        if kill -0 "$SSH_AGENT_PID" >/dev/null 2>&1; then
+            log "agend pid $SSH_AGENT_PID is valid"
+            echo "valid"
+        else
+            log "agend pid $SSH_AGENT_PID is invalid"
+            echo "invalid"
+        fi
+    else
+        log "agend pid is not found"
+        echo "unset"
+    fi
+}
+
+validate_sock() {
+    if [ "${SSH_AUTH_SOCK-}" ]; then
+        if [ -S "$SSH_AUTH_SOCK" ]; then
+            log "auth socket $SSH_AUTH_SOCK is valid"
+            echo "valid"
+        else
+            log "auth socket $SSH_AUTH_SOCK is invalid"
+            echo "invalid"
+        fi
+    else
+        log "auth socket not found"
+        echo "unset"
+    fi
+}
+
+# =============================================================================
+# Utils
+# =============================================================================
+
+readonly ENV_FILENAME=sshctl-env
+readonly LOCK_FILENAME=sshctl-lock
+
+detect_paths() {
+    USER_ID=$(id -u)
+
+    if [ -d "/run/user/$USER_ID" ] && [ -w "/run/user/$USER_ID" ]; then
+        ENV_FILE=/run/user/$USER_ID/$ENV_FILENAME
+        LOCK_FILE=/run/user/$USER_ID/$LOCK_FILENAME
+    elif [ -d "/var/run/user/$USER_ID" ] && [ -w "/var/run/user/$USER_ID" ]; then
+        ENV_FILE=/var/run/user/$USER_ID/$ENV_FILENAME
+        LOCK_FILE=/var/run/user/$USER_ID/$LOCK_FILENAME
+    else
+        ENV_FILE=/tmp/$ENV_FILENAME-$USER_ID
+        LOCK_FILE=/tmp/$LOCK_FILENAME-$USER_ID
+    fi
+}
+
+log() {
+    echo >&2 "${0##*/}: $1"
+}
+
+# =============================================================================
+# Run
+# =============================================================================
+
+main "$@"
